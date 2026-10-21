@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Pretraga javno dostupnih zakona na zakon.hr i izvoz u PDF."""
+"""Zakon PDF — sve u jednom fajlu (Python 3.10+).
+Instalacija: python3 -m pip install requests beautifulsoup4 reportlab
+Pokretanje: python3 zakon_pdf_sve_u_jednom.py
+Tkinter dolazi uz Python za macOS/Windows sa python.org.
+Font se učitava iz fonts/DejaVuSans.ttf uz ovaj program.
+PDF je izvoz dostupnog HTML-a; potpunost provjerite na izvorniku.
+Tabele se pretvaraju u tekst, slike se ne prenose.
+"""
 import argparse
 from datetime import datetime
 from pathlib import Path
@@ -82,7 +89,7 @@ def extract(soup):
 
 
 def write_pdf(title, blocks, url, destination):
-    font = Path(__file__).parent / 'fonts' / 'DejaVuSans.ttf'
+    font = Path(__file__).resolve().parent / 'fonts' / 'DejaVuSans.ttf'
     if not font.is_file():
         raise ValueError('Nedostaje fonts/DejaVuSans.ttf. Raspakujte cijeli ZIP paket.')
     pdfmetrics.registerFont(TTFont('ZakonSans', str(font)))
@@ -114,48 +121,238 @@ def write_pdf(title, blocks, url, destination):
         temp.unlink(missing_ok=True)
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('upit', nargs='?', help='Naziv zakona ili direktan zakon.hr URL')
-    parser.add_argument('--izlaz', type=Path, default=Path('pdf_zakoni'), help='Izlazni direktorijum')
-    args = parser.parse_args()
-    query = (args.upit or input('Unesite naziv zakona ili zakon.hr URL: ')).strip()
-    if not query:
-        raise ValueError('Unos je prazan.')
-    with requests.Session() as session:
-        session.headers['User-Agent'] = 'ZakonPDF/1.0 (personal document export)'
-        if query.startswith(('https://', 'http://')):
-            url = query
+import multiprocessing
+import queue
+import time
+import webbrowser
+import subprocess
+import os
+import traceback
+
+def worker(kind, payload, events):
+    """Mreža, HTML i PDF rade u zasebnom procesu; Tk ostaje slobodan."""
+    try:
+        with requests.Session() as session:
+            session.headers['User-Agent'] = 'ZakonPDF/2.0 (personal document export)'
+            if kind == 'results':
+                if payload.startswith(('http://', 'https://')):
+                    soup, url = fetch(session, payload)
+                    title, _ = extract(soup)
+                    value = [(title, url)]
+                else:
+                    soup, _ = fetch(session, BASE + '/search', {'q': payload, 't': '0', 'fs': '1'})
+                    value = parse_results(soup)
+            else:
+                url, path = payload
+                soup, url = fetch(session, url)
+                title, blocks = extract(soup)
+                value = Path(path).resolve()
+                write_pdf(title, blocks, url, value)
+        events.put((kind, value))
+    except Exception as exc:
+        events.put(('error', str(exc)))
+
+class App:
+    def __init__(self, root):
+        self.root = root
+        self.results = []
+        self.busy = False
+        self.context = multiprocessing.get_context('spawn')
+        self.events = self.context.Queue()
+        self.process = None
+        self.started = 0
+        root.protocol('WM_DELETE_WINDOW', self.close)
+        self.saved = None
+        self.selected_index = None
+        self.output_dir = Path.home() / 'Downloads' / 'ZakonPDF'
+        root.report_callback_exception = self.callback_error
+        root.title('Zakoni • Pretraga i PDF')
+        root.geometry('780x560')
+        root.minsize(600, 440)
+        main = ttk.Frame(root, padding=22)
+        main.pack(fill='both', expand=True)
+        main.columnconfigure(0, weight=1)
+        main.rowconfigure(4, weight=1)
+        ttk.Label(main, text='Pronađite zakon', font=('', 22, 'bold')).grid(row=0, column=0, sticky='w')
+        ttk.Label(main, text='Unesite naziv zakona ili direktnu zakon.hr adresu.').grid(row=1, column=0, sticky='w', pady=(6, 16))
+        search = ttk.Frame(main)
+        search.grid(row=2, column=0, sticky='ew')
+        search.columnconfigure(0, weight=1)
+        self.query = ttk.Entry(search, font=('', 13))
+        self.query.grid(row=0, column=0, sticky='ew', padx=(0, 10))
+        self.query.bind('<Return>', lambda e: self.search())
+        self.search_button = ttk.Button(search, text='Pretraži', command=self.search)
+        self.search_button.grid(row=0, column=1)
+        ttk.Label(main, text='Rezultati — izaberite zakon sa liste:').grid(row=3, column=0, sticky='w', pady=(20, 8))
+        frame = ttk.Frame(main)
+        frame.grid(row=4, column=0, sticky='nsew')
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
+        self.list = ttk.Treeview(frame, columns=('title',), show='headings', selectmode='browse')
+        self.list.heading('title', text='Naziv zakona')
+        self.list.column('title', width=580, minwidth=250)
+        self.list.grid(row=0, column=0, sticky='nsew')
+        scroll = ttk.Scrollbar(frame, orient='vertical', command=self.list.yview)
+        scroll.grid(row=0, column=1, sticky='ns')
+        self.list.configure(yscrollcommand=scroll.set)
+        self.list.bind('<<TreeviewSelect>>', self.selection_changed)
+        self.list.bind('<Double-1>', lambda e: self.download())
+        self.status = tk.StringVar(value='Primjer pretrage: Zakon o radu')
+        ttk.Label(main, textvariable=self.status, wraplength=700).grid(row=5, column=0, sticky='w', pady=(10, 5))
+        self.progress = ttk.Progressbar(main, mode='indeterminate')
+        self.progress.grid(row=6, column=0, sticky='ew', pady=(0, 12))
+        actions = ttk.Frame(main)
+        actions.grid(row=7, column=0, sticky='ew')
+        self.download_button = ttk.Button(actions, text='Sačuvaj PDF', command=self.download, state='disabled')
+        self.download_button.pack(side='right')
+        self.open_button = ttk.Button(actions, text='Otvori PDF', command=self.open_pdf, state='disabled')
+        self.open_button.pack(side='left')
+        self.folder_button = ttk.Button(actions, text='Otvori folder', command=self.open_folder)
+        self.folder_button.pack(side='left', padx=8)
+        ttk.Label(main, text='PDF se čuva u Downloads/ZakonPDF. Dugme Otvori PDF radi nakon čuvanja.', foreground='#666666').grid(row=8, column=0, sticky='w', pady=(14, 0))
+        self.query.focus_set()
+        root.after(100, self.poll)
+
+    def selection_changed(self, event=None):
+        selection = self.list.selection()
+        if selection:
+            self.selected_index = int(selection[0])
+        self.download_button.configure(state='normal' if self.selected_index is not None and not self.busy else 'disabled')
+
+    def callback_error(self, kind, value, tb):
+        traceback.print_exception(kind, value, tb)
+        messagebox.showerror('Greška u interfejsu', str(value), parent=self.root)
+
+
+    def run(self, kind, payload, status):
+        self.busy = True
+        self.search_button.configure(state='disabled')
+        self.download_button.configure(state='disabled')
+        self.query.configure(state='disabled')
+        self.status.set(status)
+        self.progress.start(12)
+
+        self.started = time.monotonic()
+        self.process = self.context.Process(target=worker, args=(kind, payload, self.events), daemon=True)
+        try:
+            self.process.start()
+        except Exception as exc:
+            self.events.put(('error', str(exc)))
+
+    def close(self):
+        if self.process and self.process.is_alive():
+            self.process.terminate()
+        if self.process and self.process.pid:
+            self.process.join(timeout=0.2)
+        self.events.close()
+        self.root.destroy()
+
+    def poll(self):
+        try:
+            kind, value = self.events.get_nowait()
+        except queue.Empty:
+            if self.busy and time.monotonic() - self.started > 120:
+                if self.process and self.process.is_alive():
+                    self.process.terminate()
+                self.events.put(('error', 'Operacija traje predugo. Pokušajte ponovo.'))
+            elif self.busy and self.process and self.process.exitcode not in (None, 0):
+                self.events.put(('error', 'Radni proces je prekinut. Pokušajte ponovo.'))
         else:
-            soup, _ = fetch(session, BASE + '/search', {'q': query, 't': '0', 'fs': '1'})
-            results = parse_results(soup)
-            if not results:
-                raise ValueError('Nema rezultata na prvoj stranici. Probajte precizniji naziv ili direktan URL zakona.')
-            for i, (title, link) in enumerate(results, 1):
-                print(f'{i}. {title}\n   {link}')
-            while True:
-                choice = input('Izaberite broj zakona (Enter za odustajanje): ').strip()
-                if not choice:
+            if self.process and self.process.pid:
+                self.process.join(timeout=0)
+            self.busy = False
+            self.progress.stop()
+            self.search_button.configure(state='normal')
+            self.query.configure(state='normal')
+            if kind == 'results':
+                self.results = value
+                self.list.delete(*self.list.get_children())
+                for i, (title, url) in enumerate(value):
+                    self.list.insert('', 'end', iid=str(i), values=(title,))
+                self.status.set(f'Pronađeno: {len(value)}. Izaberite zakon i kliknite „Sačuvaj PDF“.' if value else 'Nema rezultata. Probajte precizniji naziv ili direktan URL.')
+                if value:
+                    self.list.selection_set('0')
+            elif kind == 'saved':
+                self.saved = Path(value)
+                if not self.saved.is_file() or self.saved.stat().st_size == 0:
+                    self.status.set('PDF nije pronađen nakon izvoza.')
+                    messagebox.showerror('Greška', 'PDF nije uspješno sačuvan.', parent=self.root)
+                    self.root.after(100, self.poll)
                     return
-                if choice.isdigit() and 1 <= int(choice) <= len(results):
-                    url = results[int(choice) - 1][1]
-                    break
-                print('Unesite jedan od ponuđenih brojeva.')
-        soup, url = fetch(session, url)
-        title, blocks = extract(soup)
-        slug = unicodedata.normalize('NFKD', title).encode('ascii', 'ignore').decode()
-        slug = re.sub(r'[^a-zA-Z0-9]+', '_', slug).strip('_')[:100] or 'zakon'
-        destination = args.izlaz / f'{slug}_{datetime.now():%Y%m%d_%H%M%S_%f}.pdf'
-        write_pdf(title, blocks, url, destination)
-        print(f'PDF je sačuvan: {destination.resolve()}')
+                self.open_button.configure(state='normal')
+                self.status.set(f'PDF je sačuvan: {value}')
+                messagebox.showinfo('PDF je spreman', f'Sačuvano u:\n{value}', parent=self.root)
+            else:
+                self.status.set('Operacija nije uspjela. Možete pokušati ponovo.')
+                messagebox.showerror('Greška', value, parent=self.root)
+            self.selection_changed()
+        self.root.after(100, self.poll)
+
+    def search(self):
+        if self.busy:
+            return
+        query = self.query.get().strip()
+        if not query:
+            messagebox.showinfo('Unesite naziv', 'Unesite naziv zakona ili zakon.hr URL.', parent=self.root)
+            return
+
+        # Stari rezultati se uklanjaju da ne ostanu poslije neuspjele nove pretrage.
+        self.results = []
+        self.selected_index = None
+        self.list.delete(*self.list.get_children())
+        self.run('results', query, 'Pretražujem zakon.hr…')
+
+    def download(self):
+        if self.busy:
+            return
+        selection = self.list.selection()
+        index = int(selection[0]) if selection else self.selected_index
+        if index is None or not 0 <= index < len(self.results):
+            messagebox.showinfo('Izaberite zakon', 'Prvo kliknite na zakon u listi.', parent=self.root)
+            return
+        title, url = self.results[index]
+        safe_title = ''.join(c for c in title if c.isalnum() or c in ' -_').strip()[:100] or 'zakon'
+        # Direktno čuvanje izbjegava zavisnost od macOS Save dijaloga.
+        path = self.output_dir / (safe_title + '_' + datetime.now().strftime('%Y%m%d_%H%M%S_%f') + '.pdf')
+        self.run('saved', (url, str(path)), 'Preuzimam tekst i pravim PDF…')
+
+    def open_path(self, path):
+        try:
+            path = Path(path).resolve()
+            if not path.exists():
+                raise FileNotFoundError(f'Fajl ili folder ne postoji: {path}')
+            if sys.platform == 'darwin':
+                subprocess.run(['open', str(path)], check=True, capture_output=True, text=True, timeout=10)
+            elif sys.platform == 'win32':
+                os.startfile(str(path))
+            else:
+                subprocess.run(['xdg-open', str(path)], check=True, capture_output=True, text=True, timeout=10)
+        except Exception as exc:
+            messagebox.showerror('Otvaranje nije uspjelo', str(exc), parent=self.root)
+
+    def open_pdf(self):
+        if self.saved:
+            self.open_path(self.saved)
+        else:
+            messagebox.showinfo('PDF još nije sačuvan', 'Prvo kliknite Sačuvaj PDF.', parent=self.root)
+
+    def open_folder(self):
+        try:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            messagebox.showerror('Folder nije dostupan', str(exc), parent=self.root)
+            return
+        self.open_path(self.output_dir)
+
 
 
 if __name__ == '__main__':
+    multiprocessing.freeze_support()
     try:
-        main()
-    except (ValueError, requests.RequestException, OSError) as exc:
-        print(f'Greška: {exc}', file=sys.stderr)
-        sys.exit(1)
-    except (KeyboardInterrupt, EOFError):
-        print('\nPrekinuto.', file=sys.stderr)
-        sys.exit(130)
+        import tkinter as tk
+        from tkinter import ttk, filedialog, messagebox
+    except ImportError:
+        raise SystemExit('Tkinter nije dostupan. Koristite Python za macOS/Windows sa python.org.')
+    root = tk.Tk()
+    App(root)
+    root.mainloop()
